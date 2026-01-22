@@ -1,0 +1,309 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+import csv
+
+# =========================
+# utilities
+# =========================
+def wrap_pi(x):
+    return (x + np.pi) % (2*np.pi) - np.pi
+
+def sigmoid(x):
+    # S(x)=0.5*(1+tanh(x/2))
+    return 0.5 * (1.0 + np.tanh(0.5 * x))
+
+def summarize(vals_ms, n_total):
+    # vals_ms: list of detected taucrit (ms)
+    if len(vals_ms) == 0:
+        return {
+            "n_detect": 0, "n_total": n_total,
+            "mean": np.nan, "std": np.nan, "median": np.nan,
+            "min": np.nan, "max": np.nan
+        }
+    v = np.array(vals_ms, dtype=float)
+    return {
+        "n_detect": len(v), "n_total": n_total,
+        "mean": float(np.mean(v)),
+        "std": float(np.std(v)),
+        "median": float(np.median(v)),
+        "min": float(np.min(v)),
+        "max": float(np.max(v))
+    }
+
+# =========================
+# Wilson–Cowan (projection-phase, baseline estimated from warmup)
+# =========================
+def run_wc_trial(
+    fL, C=0.2, seed=0,
+    tauE=0.01, tauI=0.01,
+    dt=1e-3, T=300.0,
+    sigma_tau=2e-3,
+    df=1.0, noise_sigma=0.4,
+    tau0=0.01, tau_min=0.001, tau_max=0.1,
+    warmup_sec=90.0,
+    phase_thresh=1.8,
+    baseline_sec=20.0  # warmup末尾のこの秒数で中心点を推定
+):
+    rng = np.random.default_rng(seed)
+    n = int(T/dt)
+
+    # parameters
+    wEE, wEI, wIE, wII = 8.0, 12.0, 10.0, 2.0
+
+    # init
+    EL, IL, ER, IR = rng.uniform(0.1, 0.2, 4)
+    tau = float(tau0)
+
+    # delay buffer (E only)
+    kmax = int(tau_max/dt) + 2
+    bufL = np.full(kmax, EL, dtype=float)
+    bufR = np.full(kmax, ER, dtype=float)
+    bi = 0
+
+    warmup = int(warmup_sec/dt)
+
+    # baseline window indices (within warmup tail)
+    base_len = int(baseline_sec/dt)
+    base_start = max(0, warmup - base_len)
+
+    # store baseline samples for center estimation
+    EL_base = []
+    IL_base = []
+    ER_base = []
+    IR_base = []
+
+    sqrt_dt = np.sqrt(dt)
+
+    for i in range(n):
+        # delay random walk
+        tau += sigma_tau * sqrt_dt * rng.normal()
+        tau = float(np.clip(tau, tau_min, tau_max))
+
+        k = int(tau/dt)
+        if k < 1: k = 1
+        if k > kmax-2: k = kmax-2
+
+        ELd = bufL[(bi - k) % kmax]
+        ERd = bufR[(bi - k) % kmax]
+
+        t = i * dt
+        PL = np.sin(2*np.pi*fL*t) + noise_sigma * rng.normal()
+        PR = np.sin(2*np.pi*(fL+df)*t) + noise_sigma * rng.normal()
+
+        dEL = (-EL + sigmoid(wEE*EL - wEI*IL + C*(ERd - EL) + PL)) / tauE
+        dIL = (-IL + sigmoid(wIE*EL - wII*IL)) / tauI
+        dER = (-ER + sigmoid(wEE*ER - wEI*IR + C*(ELd - ER) + PR)) / tauE
+        dIR = (-IR + sigmoid(wIE*ER - wII*IR)) / tauI
+
+        EL += dt*dEL; IL += dt*dIL
+        ER += dt*dER; IR += dt*dIR
+
+        bi = (bi + 1) % kmax
+        bufL[bi] = EL
+        bufR[bi] = ER
+
+        # collect baseline samples near end of warmup
+        if base_start <= i < warmup:
+            EL_base.append(EL); IL_base.append(IL)
+            ER_base.append(ER); IR_base.append(IR)
+
+        # decide after warmup
+        if i >= warmup:
+            if len(EL_base) == 0:
+                # fallback: use current point (shouldn't happen)
+                EL0, IL0, ER0, IR0 = EL, IL, ER, IR
+            else:
+                EL0 = float(np.mean(EL_base)); IL0 = float(np.mean(IL_base))
+                ER0 = float(np.mean(ER_base)); IR0 = float(np.mean(IR_base))
+
+            # projection-phase around estimated center
+            phiL = np.arctan2(IL - IL0, EL - EL0)
+            phiR = np.arctan2(IR - IR0, ER - ER0)
+
+            if abs(wrap_pi(phiL - phiR)) > phase_thresh:
+                return tau * 1000.0  # ms
+
+    return None
+
+# =========================
+# Phase model (Kuramoto with delay phase-rotation term)
+# =========================
+def run_phase_trial(
+    fL, C=0.2, seed=0,
+    dt=1e-3, T=300.0,
+    sigma_tau=2e-3,
+    df=1.0,
+    tau0=0.01, tau_min=0.001, tau_max=0.1,
+    warmup_sec=90.0,
+    phase_thresh=1.8
+):
+    rng = np.random.default_rng(seed)
+    n = int(T/dt)
+
+    omegaL = 2*np.pi*fL
+    omegaR = 2*np.pi*(fL+df)
+
+    phiL, phiR = rng.uniform(0, 2*np.pi, 2)
+    tau = float(tau0)
+
+    warmup = int(warmup_sec/dt)
+    sqrt_dt = np.sqrt(dt)
+
+    for i in range(n):
+        tau += sigma_tau * sqrt_dt * rng.normal()
+        tau = float(np.clip(tau, tau_min, tau_max))
+
+        if i >= warmup:
+            if abs(wrap_pi(phiL - phiR)) > phase_thresh:
+                return tau * 1000.0  # ms
+
+        fL_force = C * np.sin(phiR - phiL - omegaR * tau)
+        fR_force = C * np.sin(phiL - phiR - omegaL * tau)
+
+        phiL += (omegaL + fL_force) * dt
+        phiR += (omegaR + fR_force) * dt
+
+    return None
+
+# =========================
+# experiment runner
+# =========================
+def run_all(
+    fLs=(5,10,20,40),
+    seeds=range(1,21),
+    C=0.2,
+    out_csv="summary_taucrit.csv",
+    **kwargs
+):
+    seeds = list(seeds)
+    n_total = len(seeds)
+
+    rows = []
+
+    print("Simulating...")
+    for f in fLs:
+        t0 = time.time()
+
+        wc_vals = []
+        ph_vals = []
+
+        for s in seeds:
+            v = run_wc_trial(f, C=C, seed=s, **kwargs)
+            if v is not None:
+                wc_vals.append(v)
+
+        for s in seeds:
+            v = run_phase_trial(f, C=C, seed=s, **kwargs)
+            if v is not None:
+                ph_vals.append(v)
+
+        wc_sum = summarize(wc_vals, n_total)
+        ph_sum = summarize(ph_vals, n_total)
+
+        # add normalized quantities (use mean and median when available)
+        wc_f_tau_mean = f * wc_sum["mean"] if np.isfinite(wc_sum["mean"]) else np.nan
+        wc_f_tau_median = f * wc_sum["median"] if np.isfinite(wc_sum["median"]) else np.nan
+        ph_f_tau_mean = f * ph_sum["mean"] if np.isfinite(ph_sum["mean"]) else np.nan
+        ph_f_tau_median = f * ph_sum["median"] if np.isfinite(ph_sum["median"]) else np.nan
+
+        rows.append({
+            "fL_Hz": f,
+            "model": "WilsonCowan",
+            **wc_sum,
+            "f_tau_mean": wc_f_tau_mean,
+            "f_tau_median": wc_f_tau_median
+        })
+        rows.append({
+            "fL_Hz": f,
+            "model": "Phase",
+            **ph_sum,
+            "f_tau_mean": ph_f_tau_mean,
+            "f_tau_median": ph_f_tau_median
+        })
+
+        print(f"Done fL={f}Hz  (WC n={wc_sum['n_detect']}/{n_total}, Phase n={ph_sum['n_detect']}/{n_total})  "
+              f"{time.time()-t0:.1f}s")
+
+    # write CSV
+    with open(out_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+
+    return rows
+
+def make_fig(rows, title_prefix="Fig1"):
+    # split rows
+    fLs = sorted(set(r["fL_Hz"] for r in rows))
+    wc = {r["fL_Hz"]: r for r in rows if r["model"]=="WilsonCowan"}
+    ph = {r["fL_Hz"]: r for r in rows if r["model"]=="Phase"}
+
+    wc_mean = [wc[f]["mean"] for f in fLs]
+    wc_std  = [wc[f]["std"] for f in fLs]
+    ph_mean = [ph[f]["mean"] for f in fLs]
+    ph_std  = [ph[f]["std"] for f in fLs]
+
+    wc_ft = [wc[f]["f_tau_mean"] for f in fLs]
+    ph_ft = [ph[f]["f_tau_mean"] for f in fLs]
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+
+    ax[0].errorbar(fLs, wc_mean, yerr=wc_std, fmt='o-', capsize=4, label='Wilson–Cowan')
+    ax[0].errorbar(fLs, ph_mean, yerr=ph_std, fmt='s--', capsize=4, label='Phase model')
+    ax[0].set_xlabel("Frequency fL (Hz)")
+    ax[0].set_ylabel("tau_crit (ms)")
+    ax[0].set_title(f"{title_prefix}A: tau_crit vs fL")
+    ax[0].legend()
+
+    ax[1].plot(fLs, wc_ft, 'o-', label='Wilson–Cowan')
+    ax[1].plot(fLs, ph_ft, 's--', label='Phase model')
+    ax[1].set_xlabel("Frequency fL (Hz)")
+    ax[1].set_ylabel("fL * tau_crit (ms·Hz)")
+    ax[1].set_title(f"{title_prefix}B: fL*tau_crit vs fL")
+    ax[1].legend()
+
+    plt.tight_layout()
+    plt.show()
+
+# =========================
+# main
+# =========================
+if __name__ == "__main__":
+    fLs = [5, 10, 20, 40]
+    seeds = range(1, 21)
+
+    rows = run_all(
+        fLs=fLs,
+        seeds=seeds,
+        C=0.2,
+        out_csv="summary_taucrit.csv",
+        # common params
+        dt=1e-3,
+        T=300.0,
+        warmup_sec=90.0,
+        sigma_tau=2e-3,
+        tau0=0.01,
+        tau_min=0.001,
+        tau_max=0.1,
+        df=1.0,
+        phase_thresh=1.8,
+        # WC-only
+        tauE=0.01,
+        tauI=0.01,
+        noise_sigma=0.4,
+        baseline_sec=20.0
+    )
+
+    # print table-like summary
+    for f in fLs:
+        wc = next(r for r in rows if r["model"]=="WilsonCowan" and r["fL_Hz"]==f)
+        ph = next(r for r in rows if r["model"]=="Phase" and r["fL_Hz"]==f)
+        print(f"\nfL={f} Hz")
+        print(f"  WC   : n={wc['n_detect']}/{wc['n_total']}  mean±std={wc['mean']:.2f}±{wc['std']:.2f} ms  "
+              f"median={wc['median']:.2f}  min-max={wc['min']:.2f}-{wc['max']:.2f}  f*tau(mean)={wc['f_tau_mean']:.1f}")
+        print(f"  Phase: n={ph['n_detect']}/{ph['n_total']}  mean±std={ph['mean']:.2f}±{ph['std']:.2f} ms  "
+              f"median={ph['median']:.2f}  min-max={ph['min']:.2f}-{ph['max']:.2f}  f*tau(mean)={ph['f_tau_mean']:.1f}")
+
+    make_fig(rows, title_prefix="Figure 1")
+    print("\nWrote: summary_taucrit.csv")
